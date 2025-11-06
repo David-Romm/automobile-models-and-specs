@@ -25,16 +25,19 @@ class AutomobilesExport implements FromCollection, WithHeadings
      */
     public function headings(): array
     {
+        // Note: dataset columns are model attributes; headings are for readability only
         return [
             'id',
+            'url_hash',
+            'url',
             'brand_id',
             'name',
-            'url',
-            'image',
-            'price',
-            'engine_id',
-            'engine_name',
-            'engine_specs',
+            'body_type',
+            'segment',
+            'infotainment',
+            'description',
+            'press_release',
+            'photos',
             'created_at',
             'updated_at',
         ];

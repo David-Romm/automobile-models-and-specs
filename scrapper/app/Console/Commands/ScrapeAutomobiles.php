@@ -21,7 +21,7 @@ class ScrapeAutomobiles extends Command
      *
      * @var string
      */
-    protected $signature = 'scrape:automobiles {--start-over=}';
+    protected $signature = 'scrape:automobiles {--start-over=} {--limit=} {--fast}';
 
     /**
      * The console command description.
@@ -62,7 +62,7 @@ class ScrapeAutomobiles extends Command
         //Scrape brands from scratch.
         $this->call('scrape:brands');
 
-        //Print an info about process.
+    //Print an info about process.
         $this->output->info('Looking for automobile models.');
 
         //Get rows as array that keeps row DOMs.
@@ -70,18 +70,24 @@ class ScrapeAutomobiles extends Command
 
         if ($automobileRowsDOMs) {
 
+            // Optionally limit how many NEW models to process
+            $limit = $this->option('limit');
+            $limit = is_null($limit) ? null : (int)$limit;
+
             //Count automobile rows count.
             $modelsCount = count($automobileRowsDOMs);
 
             //Create a console progressbar.
             $progressbar = $this
                 ->output
-                ->createProgressBar($modelsCount);
+                ->createProgressBar($limit ? min($limit, $modelsCount) : $modelsCount);
             $progressbar->setFormat('very_verbose');
             $progressbar->start();
 
             //Print an info about models count.
             $this->output->info($modelsCount . ' models found.');
+
+            $processedNew = 0;
 
             foreach ($automobileRowsDOMs as $automobileRowDOM) {
 
@@ -97,7 +103,10 @@ class ScrapeAutomobiles extends Command
 
                     //If automobile exists in database, do not process it.
                     if ($automobile) {
-                        $progressbar->advance();
+                        // When limiting, only count newly processed ones in the progress bar
+                        if (is_null($limit)) {
+                            $progressbar->advance();
+                        }
                         continue;
                     }
 
@@ -106,8 +115,13 @@ class ScrapeAutomobiles extends Command
 
                     DB::commit();
 
-                    //Increase progressbar.
+                    //Increase progressbar (only when we actually processed a new model if limiting)
                     $progressbar->advance();
+
+                    $processedNew++;
+                    if (!is_null($limit) && $processedNew >= $limit) {
+                        break;
+                    }
 
                 }catch (Throwable $exception){
 
@@ -186,23 +200,25 @@ class ScrapeAutomobiles extends Command
 
         $pressRelease = null;
 
-        //Parse id to get press release
+        // Parse id to get press release
         $iForPressRelease = $pageDom->find('[onclick^="aeshowpress("]', 0);
 
         if ($iForPressRelease) {
 
-            $onClick = $iForPressRelease->getAttribute('onclick');
-            preg_match('/aeshowpress\(([0-9]*)\,/i', $onClick, $matches);
+            $onClick = $iForPressRelease->getAttribute('onclick') ?? '';
 
-            if (is_numeric($matches[1])) {
+            if (preg_match('/aeshowpress\((\d+)\s*,/i', $onClick, $matches) && isset($matches[1])) {
 
-                $pressRelease = browseUrl('https://www.autoevolution.com/rhh.php?k=pr_cars&i=' . $matches[1]);
-                $pressRelease = str_get_html($pressRelease);
-                $pressRelease = $this->dropHtmlAttributes(
-                    $pressRelease
-                        ->find('.content', 0)
-                        ->innertext
-                );
+                $raw = browseUrl('https://www.autoevolution.com/rhh.php?k=pr_cars&i=' . $matches[1]);
+                if ($raw) {
+                    $prDom = str_get_html($raw);
+                    if ($prDom) {
+                        $contentNode = $prDom->find('.content', 0) ?? $prDom->find('.fl.newstext', 0) ?? $prDom->find('body', 0);
+                        if ($contentNode) {
+                            $pressRelease = $this->dropHtmlAttributes($contentNode->innertext);
+                        }
+                    }
+                }
 
             }
 
@@ -255,9 +271,9 @@ class ScrapeAutomobiles extends Command
             die();
         }
 
-        //Make another request to get all automobiles
+        //Make another request to get all automobiles (reuse brandIds to avoid duplicate request)
         $pageContents = browseUrlPost('https://www.autoevolution.com/carfinder/', [
-            'n[brand]' => $this->getBrandIds(),
+            'n[brand]' => $brandIds,
             'n[submitted]' => 1
         ]);
 
@@ -348,11 +364,27 @@ class ScrapeAutomobiles extends Command
                 'brand_id' => $brand->id,
                 'name' => $name,
                 'description' => $this->getContent($pageDom),
-                'press_release' => $this->getPressRelease($pageDom),
-                'photos' => $this->getPhotos($pageDom),
+                'press_release' => $this->option('fast') ? null : $this->getPressRelease($pageDom),
+                'photos' => $this->option('fast') ? null : $this->getPhotos($pageDom),
             ]);
 
-            $this->processEngineDOMs($automobile->id, $pageDom);
+            // First, try to detect body type, segment, infotainment from page-level data
+            $pageLevelBodyType = $this->getBodyType($pageDom);
+            $pageLevelSegment = $this->getSegment($pageDom);
+            $pageLevelInfotainment = $this->getInfotainment($pageDom);
+
+            // Process engines and try to detect these fields from specs as a fallback
+            $engineDetections = $this->processEngineDOMs($automobile->id, $pageDom);
+
+            $finalBodyType = $pageLevelBodyType ?? ($engineDetections['body_type'] ?? null);
+            $finalSegment = $pageLevelSegment ?? ($engineDetections['segment'] ?? null);
+            $finalInfotainment = $pageLevelInfotainment ?? ($engineDetections['infotainment'] ?? null);
+
+            $changed = false;
+            if ($finalBodyType) { $automobile->body_type = $finalBodyType; $changed = true; }
+            if ($finalSegment) { $automobile->segment = $finalSegment; $changed = true; }
+            if ($finalInfotainment) { $automobile->infotainment = $finalInfotainment; $changed = true; }
+            if ($changed) { $automobile->save(); }
 
         } else {
 
@@ -369,10 +401,14 @@ class ScrapeAutomobiles extends Command
      * @param simple_html_dom $pageDom
      * @return void
      */
-    private function processEngineDOMs(int $automobileId, simple_html_dom $pageDom): void
+    private function processEngineDOMs(int $automobileId, simple_html_dom $pageDom): array
     {
 
         $engineVariants = $pageDom->find('[data-engid]');
+
+        $detectedBodyType = null;
+        $detectedSegment = null;
+        $detectedInfotainment = null;
 
         foreach ($engineVariants as $engineVariant) {
 
@@ -411,6 +447,35 @@ class ScrapeAutomobiles extends Command
                     $specValue = $this->toTitleCase($valueColumn->plaintext ?? null);
                     $specs[$sectionName][$specName] = $specValue;
 
+                    // Try to detect body type from a likely 'Body' section
+                    if (!$detectedBodyType) {
+                        $isBodySection = ($sectionName === 'Body') || str_contains(mb_strtolower($sectionName), 'body');
+                        $specLower = mb_strtolower($specName);
+                        $isBodyTypeSpec = ($specName === 'Body Type') || str_contains($specLower, 'body type') || str_contains($specLower, 'body style');
+                        if ($isBodySection && $isBodyTypeSpec && $specValue) {
+                            $detectedBodyType = $specValue;
+                        }
+                    }
+
+                    // Try to detect segment from a general/body section
+                    if (!$detectedSegment) {
+                        $isGeneralish = ($sectionName === 'Body') || ($sectionName === 'General') || str_contains(mb_strtolower($sectionName), 'body');
+                        if ($isGeneralish && str_contains(mb_strtolower($specName), 'segment') && $specValue) {
+                            $detectedSegment = $specValue;
+                        }
+                    }
+
+                    // Try to detect infotainment from infotainment/multimedia section
+                    if (!$detectedInfotainment) {
+                        $isInfotainmentSection = ($sectionName === 'Infotainment') || str_contains(mb_strtolower($sectionName), 'infotainment') || str_contains(mb_strtolower($sectionName), 'multimedia');
+                        $specLower2 = mb_strtolower($specName);
+                        if ($isInfotainmentSection && (str_contains($specLower2, 'infotainment') || str_contains($specLower2, 'system'))) {
+                            if ($specValue) {
+                                $detectedInfotainment = $specValue;
+                            }
+                        }
+                    }
+
                 }
 
             }
@@ -425,7 +490,186 @@ class ScrapeAutomobiles extends Command
 
         }
 
+        return [
+            'body_type' => $detectedBodyType,
+            'segment' => $detectedSegment,
+            'infotainment' => $detectedInfotainment,
+        ];
 
+    }
+
+    /**
+     * Try to get Segment from page-level tables or JSON-LD/microdata.
+     */
+    private function getSegment(simple_html_dom $pageDom): string|null
+    {
+        // Plaintext header fallback (e.g., "Segment: Medium Premium")
+        $plain = $pageDom->plaintext ?? '';
+        if ($plain) {
+            if (preg_match('/Segment\s*:\s*(.+?)(?:Infotainment\s*:|\r|\n)/i', $plain, $m)) {
+                $val = trim($m[1]);
+                if ($val) return $this->toTitleCase($val);
+            }
+        }
+        // Tables
+        foreach ($pageDom->find('tr') as $row) {
+            $cols = $row->find('td');
+            if (count($cols) !== 2) continue;
+            $label = $this->toTitleCase($cols[0]->plaintext ?? '');
+            $value = $this->toTitleCase($cols[1]->plaintext ?? '');
+            if (str_contains(mb_strtolower($label), 'segment') && $value) return $value;
+        }
+        // Microdata (rare)
+        $item = $pageDom->find('[itemprop="segment"]', 0);
+        if ($item) {
+            $text = trim($item->plaintext ?? '');
+            if ($text) return $this->toTitleCase($text);
+            $content = trim($item->getAttribute('content') ?? '');
+            if ($content) return $this->toTitleCase($content);
+        }
+        // JSON-LD guess
+        foreach ($pageDom->find('script[type="application/ld+json"]') as $script) {
+            $json = json_decode($script->innertext ?? '', true);
+            if (!$json) continue;
+            $candidates = [];
+            if (is_array($json)) {
+                $isAssoc = array_keys($json) !== range(0, count($json) - 1);
+                $candidates = $isAssoc ? [$json] : $json;
+            }
+            foreach ($candidates as $node) {
+                if (!is_array($node)) continue;
+                foreach (['segment','vehicleSegment','vehicleClass'] as $k) {
+                    if (!empty($node[$k]) && is_string($node[$k])) return $this->toTitleCase($node[$k]);
+                }
+                foreach (['vehicleModel','model'] as $childKey) {
+                    if (!empty($node[$childKey]) && is_array($node[$childKey])) {
+                        foreach (['segment','vehicleSegment','vehicleClass'] as $k) {
+                            if (!empty($node[$childKey][$k]) && is_string($node[$childKey][$k])) return $this->toTitleCase($node[$childKey][$k]);
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Try to get Infotainment from page-level tables.
+     */
+    private function getInfotainment(simple_html_dom $pageDom): string|null
+    {
+        // Plaintext header fallback (icons may follow, so capture tokens on page too)
+        $plain = $pageDom->plaintext ?? '';
+        if ($plain) {
+            if (preg_match('/Infotainment\s*:\s*(.+?)(?:\r|\n|Specs\s*&\s*engine\s*options)/i', $plain, $m)) {
+                $val = trim($m[1]);
+                if ($val && strip_tags($val)) return $this->toTitleCase($val);
+            }
+            $tokens = [];
+            foreach ([
+                'Apple CarPlay',
+                'Android Auto',
+                'Android Automotive',
+                'Apple CarPlay Wireless',
+                'Android Auto Wireless'
+            ] as $t) {
+                if (stripos($plain, $t) !== false) $tokens[] = $t;
+            }
+            if ($tokens) return implode(', ', array_values(array_unique($tokens)));
+        }
+        // Tables
+        foreach ($pageDom->find('tr') as $row) {
+            $cols = $row->find('td');
+            if (count($cols) !== 2) continue;
+            $label = $this->toTitleCase($cols[0]->plaintext ?? '');
+            $value = $this->toTitleCase($cols[1]->plaintext ?? '');
+            $lower = mb_strtolower($label);
+            if ((str_contains($lower, 'infotainment') || str_contains($lower, 'multimedia')) && $value) return $value;
+        }
+        // No solid microdata/JSON-LD source known; return null if not found
+        return null;
+    }
+
+    /**
+     * Try to extract body type from page-level content (outside engine variants).
+     * Heuristics:
+     *  - Look for rows where first cell contains 'Body Type' or 'Body Style'.
+     *  - Look for microdata itemprop="bodyType"/"bodyStyle".
+     *  - Parse JSON-LD blocks and look for bodyType/vehicleBodyType/bodyStyle fields.
+     *
+     * @param simple_html_dom $pageDom
+     * @return string|null
+     */
+    private function getBodyType(simple_html_dom $pageDom): string|null
+    {
+        // Plaintext header fallback (e.g., "Body style: Wagon ... Segment: ...")
+        $plain = $pageDom->plaintext ?? '';
+        if ($plain) {
+            if (preg_match('/Body\s*style\s*:\s*(.+?)(?:Segment\s*:|Infotainment\s*:|\r|\n)/i', $plain, $m)) {
+                $val = trim($m[1]);
+                if ($val) return $this->toTitleCase($val);
+            }
+        }
+        // 1) Generic table scan: find tr with two tds, first matching label
+        foreach ($pageDom->find('tr') as $row) {
+            $cols = $row->find('td');
+            if (count($cols) !== 2) {
+                continue;
+            }
+            $label = $this->toTitleCase($cols[0]->plaintext ?? '');
+            $value = $this->toTitleCase($cols[1]->plaintext ?? '');
+            $labelLower = mb_strtolower($label);
+            if ((str_contains($labelLower, 'body type') || str_contains($labelLower, 'body style')) && $value) {
+                return $value;
+            }
+        }
+
+        // 2) Microdata itemprop
+        $item = $pageDom->find('[itemprop="bodyType"],[itemprop="bodytype"],[itemprop="bodystyle"],[itemprop="bodyStyle"]', 0);
+        if ($item) {
+            $text = trim($item->plaintext ?? '');
+            if ($text) {
+                return $this->toTitleCase($text);
+            }
+            $content = trim($item->getAttribute('content') ?? '');
+            if ($content) {
+                return $this->toTitleCase($content);
+            }
+        }
+
+        // 3) JSON-LD blocks
+        foreach ($pageDom->find('script[type="application/ld+json"]') as $script) {
+            $json = json_decode($script->innertext ?? '', true);
+            if (!$json) {
+                continue;
+            }
+            $candidates = [];
+            if (is_array($json)) {
+                $isAssoc = array_keys($json) !== range(0, count($json) - 1);
+                $candidates = $isAssoc ? [$json] : $json;
+            }
+            foreach ($candidates as $node) {
+                if (!is_array($node)) continue;
+                $keys = ['bodyType', 'vehicleBodyType', 'bodyStyle'];
+                foreach ($keys as $k) {
+                    if (!empty($node[$k]) && is_string($node[$k])) {
+                        return $this->toTitleCase($node[$k]);
+                    }
+                }
+                // Sometimes nested under 'vehicleModel' or 'model'
+                foreach (['vehicleModel', 'model'] as $childKey) {
+                    if (!empty($node[$childKey]) && is_array($node[$childKey])) {
+                        foreach ($keys as $k) {
+                            if (!empty($node[$childKey][$k]) && is_string($node[$childKey][$k])) {
+                                return $this->toTitleCase($node[$childKey][$k]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
     }
 
 }
