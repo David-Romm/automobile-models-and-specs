@@ -222,15 +222,31 @@ class CombineAutoData extends Command
                 $photos = $photos ? [$photos] : [];
             }
 
+            // New optional fields in automobiles.json
+            $bodyType = $auto['body_type'] ?? null;
+            // Accept either 'segment' or 'segments' (if array, join)
+            $segment = $auto['segment'] ?? ($auto['segments'] ?? null);
+            if (is_array($segment)) {
+                $segment = implode(', ', array_values(array_unique(array_filter(array_map('trim', $segment)))));
+            }
+            // Infotainment can be string or array; preserve string, join arrays
+            $infotainment = $auto['infotainment'] ?? null;
+            if (is_array($infotainment)) {
+                $infotainment = implode(', ', array_values(array_unique(array_filter(array_map('trim', $infotainment)))));
+            }
+
             $record = [
-                'id'          => $autoId,
-                'brand'       => $brand['name'],
-                'name'        => trim(($auto['name'] ?? '')),
-                'description' => $auto['description'] ?? null,
-                'photos'      => $photos,
-                'logo'        => $brand['logo'],
-                'url'         => $auto['url'] ?? null,
-                'specs'       => $specs, // array of engines with parsed spec objects
+                'id'            => $autoId,
+                'brand'         => $brand['name'],
+                'name'          => trim(($auto['name'] ?? '')),
+                'body_type'     => $bodyType,
+                'segment'       => $segment,
+                'infotainment'  => $infotainment,
+                'description'   => $auto['description'] ?? null,
+                'photos'        => $photos,
+                'logo'          => $brand['logo'],
+                'url'           => $auto['url'] ?? null,
+                'specs'         => $specs, // array of engines with parsed spec objects
             ];
 
             fwrite($out, json_encode($record, JSON_UNESCAPED_SLASHES) . "\n");
