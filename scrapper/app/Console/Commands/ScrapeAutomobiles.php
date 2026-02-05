@@ -88,6 +88,8 @@ class ScrapeAutomobiles extends Command
             $this->output->info($modelsCount . ' models found.');
 
             $processedNew = 0;
+            $batchSize = 50;
+            $batchCount = 0;
 
             foreach ($automobileRowsDOMs as $automobileRowDOM) {
 
@@ -107,6 +109,7 @@ class ScrapeAutomobiles extends Command
                         if (is_null($limit)) {
                             $progressbar->advance();
                         }
+                        DB::commit();
                         continue;
                     }
 
@@ -119,6 +122,14 @@ class ScrapeAutomobiles extends Command
                     $progressbar->advance();
 
                     $processedNew++;
+                    $batchCount++;
+
+                    // Commit batch every 50 cars
+                    if ($batchCount >= $batchSize) {
+                        $this->output->writeln("\n[Checkpoint] Saved {$batchCount} cars (total new: {$processedNew})");
+                        $batchCount = 0;
+                    }
+
                     if (!is_null($limit) && $processedNew >= $limit) {
                         break;
                     }
@@ -351,7 +362,7 @@ class ScrapeAutomobiles extends Command
 
             $name = $pageDom->find('.newstitle', 0)->plaintext ?? null;
             $brandName = trim($pageDom->find('[itemprop="itemListElement"]', 2)->plaintext ?? null);
-            $brand = Brand::where('name', $brandName)->first();
+            $brand = Brand::whereRaw('LOWER(name) = LOWER(?)', [$brandName])->first();
 
             if (!$brand) {
                 throw new Exception($brandName . ' could not found in database.');
